@@ -5,7 +5,7 @@ import { clone, newId, sha256, stableStringify } from './persistence.mjs'
 
 const OPERATIONS = new Set(['read', 'write', 'execute'])
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'refusal', 'cancelled', 'max_turn_requests'])
-const ACTIVE_TASK_STATUSES = new Set(['queued', 'running', 'waiting_permission', 'pausing', 'cancelling', 'paused', 'needs_reconcile', 'waiting_review', 'rework_required'])
+const ACTIVE_TASK_STATUSES = new Set(['queued', 'running', 'waiting_permission', 'pausing', 'cancelling', 'collecting_evidence', 'paused', 'needs_reconcile', 'waiting_review', 'rework_required'])
 const RUNNABLE_TASK_STATUSES = new Set(['queued', 'running', 'rework_required', 'paused', 'needs_reconcile'])
 
 function now() {
@@ -196,11 +196,12 @@ function taskBySession(state, sessionId) {
 }
 
 export class BridgeCore extends EventEmitter {
-  constructor({ config, store, dsh }) {
+  constructor({ config, store, dsh, permissionScopeChecker = toolCallWithinScope }) {
     super()
     this.config = config
     this.store = store
     this.dsh = dsh
+    this.permissionScopeChecker = permissionScopeChecker
     this.dsh.on('update', update => { void this.onDshUpdate(update).catch(error => this.emit('internal-error', { stage: 'dsh.update', error: String(error.message ?? error) })) })
     this.dsh.on('permission-request', request => { void this.onPermissionRequest(request).catch(error => this.emit('internal-error', { stage: 'permission.request', error: String(error.message ?? error) })) })
     this.dsh.on('permission-timeout', request => { void this.onPermissionTerminal(request, 'timeout').catch(error => this.emit('internal-error', { stage: 'permission.timeout', error: String(error.message ?? error) })) })
@@ -213,7 +214,7 @@ export class BridgeCore extends EventEmitter {
   async open() {
     await this.store.open()
     for (const task of Object.values(this.store.state.tasks)) {
-      if (['queued', 'running', 'waiting_permission', 'pausing', 'cancelling'].includes(task.status)) {
+      if (['queued', 'running', 'waiting_permission', 'pausing', 'cancelling', 'collecting_evidence'].includes(task.status)) {
         task.status = 'needs_reconcile'
         task.error = 'bridge restarted while task was active; inspect the persisted evidence and explicitly resume or cancel'
         task.updatedAt = now()
@@ -242,7 +243,7 @@ export class BridgeCore extends EventEmitter {
     })
   }
 
-  createEvidenceInState(state, task, { kind, label, content }) {
+  createEvidenceInState(state, task, { kind, label, content, executionRunId }) {
     const id = newId('evidence')
     const safeContent = redactValue(content, this.config.limits.evidenceBytes)
     const record = {
@@ -251,7 +252,7 @@ export class BridgeCore extends EventEmitter {
       planId: task.planId,
       planVersion: task.planVersion,
       planHash: task.planHash,
-      executionRunId: task.executionRunId,
+      executionRunId: executionRunId ?? task.executionRunId,
       kind,
       label: label ?? kind,
       createdAt: now(),
@@ -265,12 +266,12 @@ export class BridgeCore extends EventEmitter {
     return record
   }
 
-  async addEvidence({ taskId, kind, label, content }) {
+  async addEvidence({ taskId, kind, label, content, executionRunId }) {
     let record
     await this.store.mutate(state => {
       const task = state.tasks[taskId]
       if (task === undefined) throw errorWithCode(`unknown task: ${taskId}`, 'UNKNOWN_TASK')
-      record = this.createEvidenceInState(state, task, { kind, label, content })
+      record = this.createEvidenceInState(state, task, { kind, label, content, executionRunId })
     })
     return clone(record)
   }
@@ -531,7 +532,7 @@ export class BridgeCore extends EventEmitter {
       try {
         const baseline = await this.getTask(taskId)
         const before = await captureWorkspaceSnapshot(baseline.workspace, this.config.limits, { allowedPaths: baseline.allowedPaths })
-        const evidence = await this.addEvidence({ taskId, kind: 'workspace.before', label: '执行前工作区状态', content: before })
+        const evidence = await this.addEvidence({ taskId, kind: 'workspace.before', label: '执行前工作区状态', content: before, executionRunId: runId })
         await this.store.mutate(state => {
           const current = state.tasks[taskId]
           if (current !== undefined && current.executionRunId === runId) current.workspaceBeforeEvidenceId = evidence.id
@@ -561,42 +562,61 @@ export class BridgeCore extends EventEmitter {
 
   async finishTaskPrompt(taskId, result, runId) {
     let task
+    let normalFinalStatus
     await this.store.mutate(state => {
       task = state.tasks[taskId]
       if (task === undefined || task.executionRunId !== runId) return
       task.stopReason = STOP_REASONS.has(result.stopReason) ? result.stopReason : 'unknown'
       task.assistantOutput = capText(redactText(result.assistantText), this.config.limits.evidenceBytes)
       task.pendingPermissionId = undefined
+      task.pendingPermission = undefined
       if (task.pauseRequested === true) {
-        task.status = 'paused'
-        delete task.pauseRequested
+        normalFinalStatus = 'paused'
       } else if (task.cancelRequested === true || result.stopReason === 'cancelled') {
-        task.status = task.cancelRequested === true ? 'cancelled' : 'failed'
-        delete task.cancelRequested
+        normalFinalStatus = task.cancelRequested === true ? 'cancelled' : 'failed'
       } else if (result.stopReason === 'end_turn' || result.stopReason === 'max_tokens') {
-        task.status = 'waiting_review'
+        normalFinalStatus = 'waiting_review'
       } else {
-        task.status = 'failed'
+        normalFinalStatus = 'failed'
         task.error = `DSH prompt stopped with ${result.stopReason}`
       }
-      this.appendEventInMemory(task, 'dsh.prompt_finished', { stopReason: task.stopReason, assistantOutput: task.assistantOutput, status: task.status })
+      task.status = 'collecting_evidence'
+      this.appendEventInMemory(task, 'dsh.prompt_finished', { stopReason: task.stopReason, assistantOutput: task.assistantOutput, status: task.status, finalStatus: normalFinalStatus, runId })
     })
     if (task === undefined || task.executionRunId !== runId) return
-    await this.addEvidence({ taskId, kind: 'dsh.prompt_result', label: 'DSH ACP 提示词结果', content: { stopReason: result.stopReason, assistantOutput: result.assistantText } })
-    let before
     try {
+      await this.addEvidence({ taskId, kind: 'dsh.prompt_result', label: 'DSH ACP 提示词结果', content: { stopReason: result.stopReason, assistantOutput: result.assistantText }, executionRunId: runId })
+      let before
       if (task.workspaceBeforeEvidenceId !== undefined) {
         before = await this.getEvidence(task.workspaceBeforeEvidenceId).then(evidence => evidence.content).catch(() => undefined)
       }
       const after = await captureWorkspaceSnapshot(task.workspace, this.config.limits, { allowedPaths: task.allowedPaths })
-      await this.addEvidence({ taskId, kind: 'workspace.after', label: '执行后工作区状态', content: after })
-      await this.addEvidence({ taskId, kind: 'workspace.delta', label: '执行期间工作区总变更', content: await captureWorkspaceDelta(before, after, this.config.limits) })
-      await this.appendEvent(taskId, 'evidence.workspace_after', { captured: true })
+      await this.addEvidence({ taskId, kind: 'workspace.after', label: '执行后工作区状态', content: after, executionRunId: runId })
+      await this.addEvidence({ taskId, kind: 'workspace.delta', label: '执行期间工作区总变更', content: await captureWorkspaceDelta(before, after, this.config.limits), executionRunId: runId })
+      await this.appendEvent(taskId, 'evidence.workspace_after', { captured: true, runId })
     } catch (error) {
-      await this.appendEvent(taskId, 'evidence.workspace_after_failed', { error: error.message })
+      normalFinalStatus = 'failed'
+      await this.appendEvent(taskId, 'evidence.workspace_after_failed', { error: error.message, runId })
     }
-    const finalTask = await this.getTask(taskId)
-    await this.addEvidence({ taskId, kind: 'task.event_log', label: '桥接任务事件索引', content: finalTask })
+    await this.store.mutate(state => {
+      const current = state.tasks[taskId]
+      if (current === undefined || current.executionRunId !== runId) return
+      const finalStatus = current.cancelRequested === true
+        ? 'cancelled'
+        : (current.pauseRequested === true ? 'paused' : normalFinalStatus)
+      this.appendEventInMemory(current, 'evidence.collection_complete', { runId, finalStatus })
+      current.status = finalStatus
+      delete current.cancelRequested
+      delete current.pauseRequested
+      current.evidenceCollectionCompletedAt = now()
+      this.appendEventInMemory(current, `task.${finalStatus}`, { runId, evidenceComplete: true })
+      this.createEvidenceInState(state, current, {
+        kind: 'task.event_log',
+        label: '桥接任务事件索引',
+        content: current,
+        executionRunId: runId,
+      })
+    })
     this.emit('task-updated', { taskId })
   }
 
@@ -617,11 +637,11 @@ export class BridgeCore extends EventEmitter {
       this.appendEventInMemory(task, 'task.failed', { error: task.error })
     })
     if (!handled) return
-    await this.addEvidence({ taskId, kind: 'task.failure', label: '任务失败记录', content: { error: redactText(error?.message ?? error), priorTask: failedTask } })
+    await this.addEvidence({ taskId, kind: 'task.failure', label: '任务失败记录', content: { error: redactText(error?.message ?? error), priorTask: failedTask }, executionRunId: runId })
     if (failedTask !== undefined) {
       try {
         const after = await captureWorkspaceSnapshot(failedTask.workspace, this.config.limits, { allowedPaths: failedTask.allowedPaths })
-        await this.addEvidence({ taskId, kind: 'workspace.after_failure', label: '失败后的工作区状态', content: after })
+        await this.addEvidence({ taskId, kind: 'workspace.after_failure', label: '失败后的工作区状态', content: after, executionRunId: runId })
       } catch (snapshotError) {
         await this.appendEvent(taskId, 'evidence.workspace_after_failure_failed', { error: snapshotError.message })
       }
@@ -662,10 +682,15 @@ export class BridgeCore extends EventEmitter {
     const task = await this.getTask(taskId)
     if (['accepted', 'cancelled', 'failed'].includes(task.status)) return task
     let sessionToCancel
+    let permissionToDeny
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
       const activeExecution = ['running', 'waiting_permission', 'pausing', 'cancelling'].includes(current.status)
-      if (!activeExecution) {
+      if (current.status === 'collecting_evidence') {
+        current.cancelRequested = true
+        delete current.pauseRequested
+        this.appendEventInMemory(current, 'task.cancel_requested', { collectingEvidence: true })
+      } else if (!activeExecution) {
         current.status = 'cancelled'
         delete current.cancelRequested
         delete current.pauseRequested
@@ -677,9 +702,16 @@ export class BridgeCore extends EventEmitter {
         delete current.pauseRequested
         current.status = 'cancelling'
         sessionToCancel = current.dshSessionId
+        permissionToDeny = current.pendingPermissionId
+        current.pendingPermissionId = undefined
+        current.pendingPermission = undefined
+        delete current.permissionDecisionToken
         this.appendEventInMemory(current, 'task.cancel_requested', {})
       }
     })
+    if (permissionToDeny !== undefined) {
+      try { this.dsh.decidePermission(permissionToDeny, { allow: false }) } catch { /* the request may have expired */ }
+    }
     if (sessionToCancel !== undefined) await this.dsh.cancel(sessionToCancel)
     return this.getTask(taskId)
   }
@@ -766,7 +798,7 @@ export class BridgeCore extends EventEmitter {
         await this.clearPendingPermission(taskId, permissionId, 'permission.denied_scope', { operation, toolKind: pending?.toolCall?.kind })
         throw errorWithCode(`permission denied because plan does not allow operation: ${operation}`, 'PERMISSION_OUT_OF_SCOPE')
       }
-      const pathCheck = await toolCallWithinScope(
+      const pathCheck = await this.permissionScopeChecker(
         pending?.toolCall,
         plan.scope.allowedPaths,
         plan.scope.executionCwd,
@@ -786,11 +818,26 @@ export class BridgeCore extends EventEmitter {
         )
       }
     }
-    const request = this.dsh.decidePermission(permissionId, { allow, optionId })
+    let request
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
+      if (current === undefined || current.pendingPermissionId !== permissionId || current.status !== 'waiting_permission' || current.cancelRequested === true || current.pauseRequested === true) {
+        throw errorWithCode('permission is no longer active for this task', 'PERMISSION_NOT_ACTIVE')
+      }
+      if (current.dshSessionId !== pending?.sessionId || stableStringify(current.pendingPermission) !== stableStringify(pending)) {
+        throw errorWithCode('permission request changed or expired; refresh it before deciding', 'PERMISSION_STALE')
+      }
+      if (allow === true) {
+        const currentPlan = currentApprovedPlan(state, current)
+        if (currentPlan.hash !== task.planHash) throw errorWithCode('permission plan changed; refresh the request before deciding', 'PERMISSION_STALE')
+      }
+      // Keep the final state check and the synchronous ACP decision in one
+      // serialized store mutation. cancelTask cannot interleave after this
+      // validation and before DSH receives the decision.
+      request = this.dsh.decidePermission(permissionId, { allow, optionId })
       current.pendingPermissionId = undefined
       current.pendingPermission = undefined
+      delete current.permissionDecisionToken
       this.appendEventInMemory(current, 'permission.decided', { allow: allow === true, optionId, toolKind: request.toolCall.kind })
       if (current.status === 'waiting_permission') current.status = 'running'
     })
@@ -803,6 +850,7 @@ export class BridgeCore extends EventEmitter {
       if (current === undefined || current.pendingPermissionId !== permissionId) return
       current.pendingPermissionId = undefined
       current.pendingPermission = undefined
+      delete current.permissionDecisionToken
       if (current.status === 'waiting_permission') current.status = 'running'
       this.appendEventInMemory(current, eventKind, data)
     })

@@ -8,7 +8,7 @@
 - `/mcp/control`：提交不可原地修改的计划版本、申请人工审批、启动/暂停/恢复/取消任务、提交同范围修正和记录验收。DSH 逐次权限不在 MCP 中放行。
 - inspect 与 control 使用不同 bearer token；也可启用本地 OAuth 2.1 authorization-code + PKCE 流程。
 - DSH 通过 `dsh --profile acp` 的 ACP stdio 接口长驻连接；桥接重启后不会自动把执行中的任务伪装成完成，而是标记为 `needs_reconcile`，需要先查看持久化证据，再显式恢复或取消。
-- 任务状态区分 `running`、`waiting_permission`、`pausing`、`cancelling`、`paused`、`needs_reconcile`、`waiting_review`、`rework_required`、`accepted`、`failed` 和 `cancelled`。
+- 任务状态区分 `running`、`waiting_permission`、`pausing`、`cancelling`、`collecting_evidence`、`paused`、`needs_reconcile`、`waiting_review`、`rework_required`、`accepted`、`failed` 和 `cancelled`；DSH prompt 结束后必须先完成本轮证据收集，才会进入 `waiting_review`。
 - 执行前/后工作区快照、HEAD 间的提交变更、DSH ACP 语义事件、提示词结果和验收记录形成可读取的证据索引；输出会做常见凭据脱敏并设大小上限。
 - 人工审批不是 MCP 工具：模型只能创建审批请求，真正放行使用独立的 `POST /v1/approvals/<approvalId>` 人工通道。
 - DSH 权限请求同样不属于 MCP 工具，使用独立的 `POST /v1/permission-requests/<permissionId>` 人工通道；需要同时提供 `taskId`、`allow` 和可选 `optionId`。

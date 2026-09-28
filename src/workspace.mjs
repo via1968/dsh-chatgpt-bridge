@@ -101,13 +101,89 @@ function sensitivePath(path) {
   return SENSITIVE_PATH.test(path)
 }
 
+function decodeGitQuotedToken(token) {
+  if (!token.startsWith('"') || !token.endsWith('"')) return token
+  const raw = token.slice(1, -1)
+  const bytes = []
+  for (let index = 0; index < raw.length;) {
+    if (raw[index] !== '\\') {
+      const codePoint = raw.codePointAt(index)
+      const character = String.fromCodePoint(codePoint)
+      bytes.push(...Buffer.from(character, 'utf8'))
+      index += character.length
+      continue
+    }
+    index += 1
+    if (index >= raw.length) {
+      bytes.push('\\'.charCodeAt(0))
+      break
+    }
+    if (/[0-7]/.test(raw[index])) {
+      let digits = raw[index]
+      index += 1
+      while (digits.length < 3 && index < raw.length && /[0-7]/.test(raw[index])) digits += raw[index++]
+      bytes.push(Number.parseInt(digits, 8))
+      continue
+    }
+    const escapes = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 }
+    bytes.push(escapes[raw[index]] ?? raw.charCodeAt(index))
+    index += 1
+  }
+  return Buffer.from(bytes).toString('utf8')
+}
+
+function parseGitToken(value, start) {
+  let index = start
+  while (index < value.length && /\s/.test(value[index])) index += 1
+  if (index >= value.length) return undefined
+  if (value[index] !== '"') {
+    const begin = index
+    while (index < value.length && !/\s/.test(value[index])) index += 1
+    return { token: value.slice(begin, index), next: index }
+  }
+  const begin = index
+  index += 1
+  while (index < value.length) {
+    if (value[index] === '\\') {
+      index += 1
+      if (index >= value.length) break
+      if (/[0-7]/.test(value[index])) {
+        let digits = 0
+        while (index < value.length && digits < 3 && /[0-7]/.test(value[index])) {
+          index += 1
+          digits += 1
+        }
+      } else {
+        index += 1
+      }
+      continue
+    }
+    if (value[index] === '"') {
+      index += 1
+      return { token: decodeGitQuotedToken(value.slice(begin, index)), next: index }
+    }
+    index += 1
+  }
+  return undefined
+}
+
+function parseGitDiffHeader(line) {
+  const prefix = 'diff --git '
+  if (!line.startsWith(prefix)) return undefined
+  const left = parseGitToken(line, prefix.length)
+  if (left === undefined) return undefined
+  const right = parseGitToken(line, left.next)
+  if (right === undefined) return undefined
+  return [left.token, right.token]
+}
+
 function redactGitDiff(value) {
   let sensitive = false
   const output = []
   for (const line of String(value ?? '').split(/\r?\n/)) {
-    const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line)
-    if (header !== null) {
-      sensitive = sensitivePath(header[1]) || sensitivePath(header[2])
+    const header = parseGitDiffHeader(line)
+    if (line.startsWith('diff --git ')) {
+      sensitive = header === undefined || header.some(path => sensitivePath(path))
       output.push(redactText(line))
       if (sensitive) output.push('[REDACTED SENSITIVE FILE DIFF]')
       continue

@@ -14,6 +14,8 @@
 
 每次收到 ACP `session/update` 都会立即追加一条独立的 `dsh.session_update` 证据；`task.events` 仍是用于状态查询的限长展示窗口，不能作为完整事件原件。事件内容同样执行脱敏和单条大小限制，超过限制的字段会明确标记截断。
 
+DSH prompt 结束后，任务先处于 `collecting_evidence`，待本轮 prompt、工作区、差异和事件索引证据全部写入后才发布 `waiting_review`。执行证据显式绑定产生它的 `executionRunId`，不会从后来启动的轮次动态推导；证据收集期间不能提交 correction 或验收。
+
 `accepted` 只表示桥接器验证了如下条件：
 
 1. 计划版本仍是被批准的版本；

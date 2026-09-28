@@ -75,6 +75,23 @@ test('sensitive tracked diff context is redacted as a whole file block', async (
   assert.doesNotMatch(snapshot.git.diff.text, /baseline comment|changed comment/)
 })
 
+test('sensitive diff blocks with Git-quoted Unicode paths are redacted', async () => {
+  const { root, allowed } = await makeRepo()
+  const chineseDirectory = join(allowed, '中文目录')
+  await mkdir(chineseDirectory)
+  await git(root, 'config', 'core.quotePath', 'true')
+  const envPath = join(chineseDirectory, '.env')
+  await writeFile(envPath, 'CUSTOM_VALUE=synthetic-unicode-review-secret\n# baseline comment\n')
+  await git(root, 'add', '-f', join(relative(root, chineseDirectory), '.env'))
+  await git(root, 'commit', '-m', 'add Unicode sensitive file')
+  await writeFile(envPath, 'CUSTOM_VALUE=synthetic-unicode-review-secret\n# changed comment\n')
+
+  const snapshot = await captureWorkspaceSnapshot(root, limits, { allowedPaths: [allowed] })
+  assert.match(snapshot.git.diff.text, /REDACTED SENSITIVE FILE DIFF/)
+  assert.doesNotMatch(snapshot.git.diff.text, /synthetic-unicode-review-secret/)
+  assert.doesNotMatch(snapshot.git.diff.text, /baseline comment|changed comment/)
+})
+
 test('workspace delta records committed changes between HEADs', async () => {
   const { root, allowed } = await makeRepo()
   const before = await captureWorkspaceSnapshot(root, limits, { allowedPaths: [allowed] })

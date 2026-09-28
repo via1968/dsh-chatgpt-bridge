@@ -84,7 +84,7 @@ async function waitFor(predicate, timeoutMs = 2000) {
   assert.fail('condition was not reached before timeout')
 }
 
-async function makeCore({ maxTaskEvents } = {}) {
+async function makeCore({ maxTaskEvents, permissionScopeChecker } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-core-'))
   temporaryRoots.push(root)
   const workspace = join(root, 'workspace')
@@ -107,7 +107,7 @@ async function makeCore({ maxTaskEvents } = {}) {
   const config = loadConfig({ cwd: root, env })
   const store = await new JsonStore(join(root, 'data', 'state.json')).open()
   const dsh = new FakeDsh()
-  const core = await new BridgeCore({ config, store, dsh }).open()
+  const core = await new BridgeCore({ config, store, dsh, permissionScopeChecker }).open()
   return { root, workspace, config, store, dsh, core }
 }
 
@@ -279,6 +279,49 @@ test('permission checks resolve relative paths and reject sandbox upgrades', asy
   ])
 })
 
+test('cancellation invalidates a permission decision that is already checking scope', async () => {
+  const scopeEntered = deferred()
+  const releaseScope = deferred()
+  const permissionScopeChecker = async () => {
+    scopeEntered.resolve()
+    await releaseScope.promise
+    return { ok: true }
+  }
+  const { core, workspace, dsh, store } = await makeCore({ permissionScopeChecker })
+  const plan = await approvedPlan(core, workspace, { operations: ['write'] })
+  store.state.tasks['permission-cancel-race'] = {
+    id: 'permission-cancel-race',
+    planId: plan.planId,
+    planVersion: plan.version,
+    planHash: plan.hash,
+    workspace,
+    allowedPaths: [workspace],
+    executionCwd: workspace,
+    executionRunId: 'run-permission-cancel',
+    status: 'waiting_permission',
+    dshSessionId: 'permission-cancel-session',
+    pendingPermissionId: 'permission-cancel-race',
+    pendingPermission: {
+      permissionId: 'permission-cancel-race',
+      sessionId: 'permission-cancel-session',
+      toolCall: { toolCallId: 'call-cancel-race', kind: 'edit', name: 'write', rawInput: { file_path: 'inside.txt' } },
+    },
+    events: [],
+    evidenceIds: [],
+    eventSeq: 0,
+  }
+
+  const decision = core.decidePermission({ taskId: 'permission-cancel-race', permissionId: 'permission-cancel-race', allow: true, optionId: 'allow-once' })
+  await scopeEntered.promise
+  const cancelling = await core.cancelTask('permission-cancel-race')
+  assert.equal(cancelling.status, 'cancelling')
+  releaseScope.resolve()
+
+  await assert.rejects(decision, error => error.code === 'PERMISSION_NOT_ACTIVE')
+  assert.deepEqual(dsh.permissionDecisions, [{ permissionId: 'permission-cancel-race', allow: false }])
+  assert.deepEqual(dsh.cancelCalls, ['permission-cancel-session'])
+})
+
 test('unsupported multiple-path scopes fail closed before approval', async () => {
   const { core, workspace } = await makeCore()
   const first = join(workspace, 'first')
@@ -373,6 +416,39 @@ test('workspace before evidence belongs to the current run and can be accepted',
     criteria: [{ id: 'c1', result: 'pass', evidenceIds: [before.id, after.id] }],
   })
   assert.equal(accepted.status, 'accepted')
+})
+
+test('correction is blocked until the previous run finishes evidence collection', async () => {
+  const { core, workspace, dsh } = await makeCore()
+  const afterStarted = deferred()
+  const releaseAfter = deferred()
+  const addEvidence = core.addEvidence.bind(core)
+  core.addEvidence = async input => {
+    if (input.kind === 'workspace.after') {
+      afterStarted.resolve(input.executionRunId)
+      await releaseAfter.promise
+    }
+    return addEvidence(input)
+  }
+  const plan = await approvedPlan(core, workspace)
+  const started = await core.startTask({ planId: plan.planId, version: plan.version, taskId: 'evidence-collection-race' })
+  const firstRunId = await afterStarted.promise
+  assert.equal((await core.getTask(started.id)).status, 'collecting_evidence')
+
+  await assert.rejects(
+    core.sendCorrection({ taskId: started.id, correction: 'start a second run too early' }),
+    /collecting_evidence/,
+  )
+  assert.equal(dsh.promptCalls.length, 1)
+  releaseAfter.resolve()
+
+  await waitFor(async () => {
+    const current = await core.getTask(started.id)
+    return current.status === 'waiting_review' && current.evidenceIds.some(id => core.store.state.evidence[id]?.kind === 'task.event_log')
+  })
+  const task = await core.getTask(started.id)
+  const after = task.evidenceIds.map(id => core.store.state.evidence[id]).find(item => item.kind === 'workspace.after')
+  assert.equal(after.executionRunId, firstRunId)
 })
 
 test('all ACP updates are persisted as evidence when display events are truncated', async () => {
