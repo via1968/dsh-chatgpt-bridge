@@ -23,6 +23,14 @@ try {
   await manager.ensureConnected()
   const sessionId = await manager.createSession(cwd)
   console.log(JSON.stringify({ ok: true, sessionId, preflight, status: manager.status() }, null, 2))
+} catch (error) {
+  process.exitCode = 1
+  console.error(JSON.stringify({
+    ok: false,
+    code: error?.code ?? 'DSH_SMOKE_FAILED',
+    message: String(error?.message ?? error),
+    status: manager.status(),
+  }, null, 2))
 } finally {
   await manager.close()
   await rm(cwd, { recursive: true, force: true })

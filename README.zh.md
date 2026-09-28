@@ -34,6 +34,8 @@ npm start
 
 默认仅监听 `127.0.0.1:8787`。项目工作区可通过 `BRIDGE_WORKSPACE_ROOT` 限制；建议设置为需要协作的仓库根目录。桥接器会读取 DSH 所需的本机环境变量，但不会把环境变量或凭据放入 MCP 返回值。
 
+可先运行 `npm run smoke:dsh` 做 ACP 启动前策略和会话策略核对。该命令只检查 DSH ACP 连接，不执行模型 prompt，也不代表真实项目执行成功；策略不匹配时会输出结构化失败结果并在创建会话前退出。桥接任务还会拒绝无法证明读取隔离的 DSH 后端。Windows 上 `workspace-write` 只可作为 DSH 自身的写入策略，不能自动证明目录外读取受到限制，因此不能据此通过 E03 越界读取验收。
+
 ## 人工审批
 
 ChatGPT 或 MCP Inspector 调用 `bridge_request_plan_approval` 后，使用返回的 `approval.id` 查看审批内容。用户在本机独立执行：
