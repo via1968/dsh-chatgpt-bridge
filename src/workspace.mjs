@@ -177,13 +177,46 @@ function parseGitDiffHeader(line) {
   return [left.token, right.token]
 }
 
-function redactGitDiff(value) {
+function parseGitNameOnlyZ(value) {
+  return String(value ?? '').split('\0').filter(Boolean)
+}
+
+// The diff header is presentation text, not a reliable path serialization:
+// unquoted spaces are legal and quoted paths use Git's C-style escaping. Use
+// the NUL-delimited path list as the source of truth and only use the header
+// to associate a rendered diff block with one of those exact paths.
+function headerReferencesGitPath(line, path) {
+  const normalized = String(path).replaceAll('\\', '/')
+  const candidates = [`a/${normalized}`, `b/${normalized}`]
+  const parsed = parseGitDiffHeader(line)
+  if (parsed?.some(token => candidates.includes(token))) return true
+
+  for (const candidate of candidates) {
+    let offset = line.indexOf(candidate, 'diff --git '.length)
+    while (offset !== -1) {
+      const previous = offset === 'diff --git '.length ? undefined : line[offset - 1]
+      const next = line[offset + candidate.length]
+      const startsPath = previous === undefined || /\s/.test(previous) || previous === '"'
+      const endsPath = next === undefined || /\s/.test(next) || next === '"'
+      if (startsPath && endsPath) return true
+      offset = line.indexOf(candidate, offset + 1)
+    }
+  }
+  return false
+}
+
+function redactGitDiff(value, changedPaths) {
+  const paths = changedPaths?.map(path => String(path).replaceAll('\\', '/'))
   let sensitive = false
   const output = []
   for (const line of String(value ?? '').split(/\r?\n/)) {
-    const header = parseGitDiffHeader(line)
     if (line.startsWith('diff --git ')) {
-      sensitive = header === undefined || header.some(path => sensitivePath(path))
+      if (paths === undefined) {
+        sensitive = true
+      } else {
+        const matchingPaths = paths.filter(path => headerReferencesGitPath(line, path))
+        sensitive = matchingPaths.length === 0 || matchingPaths.some(path => sensitivePath(path))
+      }
       output.push(redactText(line))
       if (sensitive) output.push('[REDACTED SENSITIVE FILE DIFF]')
       continue
@@ -219,6 +252,18 @@ async function runGit(args, cwd) {
       stdout: error?.stdout ?? '',
       stderr: error?.stderr ?? String(error?.message ?? error),
     }
+  }
+}
+
+async function runGitDiffWithPaths(diffArgs, pathspecs, cwd) {
+  const namesArgs = [diffArgs[0], '--no-renames', '--name-only', '-z', ...diffArgs.slice(1)]
+  const [diff, names] = await Promise.all([
+    runGit(scopedGitArgs(diffArgs, pathspecs), cwd),
+    runGit(scopedGitArgs(namesArgs, pathspecs), cwd),
+  ])
+  return {
+    diff,
+    changedPaths: names.ok ? parseGitNameOnlyZ(names.stdout) : undefined,
   }
 }
 
@@ -311,11 +356,13 @@ export async function captureWorkspaceSnapshot(workspace, limits, { allowedPaths
   }))
   const pathspecs = await pathspecsForGit(gitRoot, canonicalAllowedPaths)
   const gitCwd = gitRoot ?? normalized
-  const status = await runGit(scopedGitArgs(['status', '--short', '--branch'], pathspecs), gitCwd)
-  const diff = await runGit(scopedGitArgs(['diff', '--binary'], pathspecs), gitCwd)
-  const cachedDiff = await runGit(scopedGitArgs(['diff', '--cached', '--binary'], pathspecs), gitCwd)
-  const head = await runGit(['rev-parse', 'HEAD'], gitCwd)
-  const branch = await runGit(['symbolic-ref', '--short', '-q', 'HEAD'], gitCwd)
+  const [status, diffResult, cachedDiffResult, head, branch] = await Promise.all([
+    runGit(scopedGitArgs(['status', '--short', '--branch'], pathspecs), gitCwd),
+    runGitDiffWithPaths(['diff', '--binary'], pathspecs, gitCwd),
+    runGitDiffWithPaths(['diff', '--cached', '--binary'], pathspecs, gitCwd),
+    runGit(['rev-parse', 'HEAD'], gitCwd),
+    runGit(['symbolic-ref', '--short', '-q', 'HEAD'], gitCwd),
+  ])
   const untracked = gitRoot === undefined ? [] : await collectUntracked(await realpath(gitRoot), normalized, pathspecs, limits.untrackedFileBytes)
   return {
     capturedAt: new Date().toISOString(),
@@ -328,8 +375,8 @@ export async function captureWorkspaceSnapshot(workspace, limits, { allowedPaths
       head: head.ok ? head.stdout.trim() : undefined,
       branch: branch.ok ? branch.stdout.trim() : undefined,
       status: trimOutput(status.stdout || status.stderr, limits.evidenceBytes),
-      diff: trimOutput(redactGitDiff(diff.stdout || diff.stderr), limits.evidenceBytes),
-      cachedDiff: trimOutput(redactGitDiff(cachedDiff.stdout || cachedDiff.stderr), limits.evidenceBytes),
+      diff: trimOutput(redactGitDiff(diffResult.diff.stdout || diffResult.diff.stderr, diffResult.changedPaths), limits.evidenceBytes),
+      cachedDiff: trimOutput(redactGitDiff(cachedDiffResult.diff.stdout || cachedDiffResult.diff.stderr, cachedDiffResult.changedPaths), limits.evidenceBytes),
       untracked,
     },
   }
@@ -337,11 +384,15 @@ export async function captureWorkspaceSnapshot(workspace, limits, { allowedPaths
 
 export async function captureWorkspaceDelta(before, after, limits) {
   const committed = { ok: false, stdout: '', stderr: 'No comparable Git HEADs were captured.' }
+  let committedPaths
   if (before?.git?.head !== undefined && after?.git?.head !== undefined && before.gitRoot !== undefined && before.gitRoot === after.gitRoot) {
-    Object.assign(committed, await runGit(
-      scopedGitArgs(['diff', '--binary', before.git.head, after.git.head], after.pathspecs ?? []),
+    const committedResult = await runGitDiffWithPaths(
+      ['diff', '--binary', before.git.head, after.git.head],
+      after.pathspecs ?? [],
       after.gitRoot ?? after.workspace,
-    ))
+    )
+    Object.assign(committed, committedResult.diff)
+    committedPaths = committedResult.changedPaths
   }
   return {
     workspace: after?.workspace,
@@ -365,7 +416,7 @@ export async function captureWorkspaceDelta(before, after, limits) {
       cachedDiff: after?.git?.cachedDiff,
       untracked: after?.git?.untracked,
     },
-    committedDuringExecution: trimOutput(redactGitDiff(committed.stdout || committed.stderr), limits.evidenceBytes),
+    committedDuringExecution: trimOutput(redactGitDiff(committed.stdout || committed.stderr, committedPaths), limits.evidenceBytes),
     committedDiffComparable: committed.ok,
   }
 }

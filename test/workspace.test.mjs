@@ -92,6 +92,26 @@ test('sensitive diff blocks with Git-quoted Unicode paths are redacted', async (
   assert.doesNotMatch(snapshot.git.diff.text, /baseline comment|changed comment/)
 })
 
+test('sensitive diff blocks with unquoted spaces in paths are redacted', async () => {
+  const { root, allowed } = await makeRepo()
+  const spacedDirectory = join(allowed, 'my project dir')
+  await mkdir(spacedDirectory)
+  const envPath = join(spacedDirectory, '.env')
+  const notesPath = join(spacedDirectory, 'notes.txt')
+  await writeFile(envPath, 'CUSTOM_VALUE=synthetic-spaced-review-secret\n# baseline comment\n')
+  await writeFile(notesPath, 'baseline note\n')
+  await git(root, 'add', '-f', join(relative(root, spacedDirectory), '.env'), join(relative(root, spacedDirectory), 'notes.txt'))
+  await git(root, 'commit', '-m', 'add spaced sensitive file')
+  await writeFile(envPath, 'CUSTOM_VALUE=synthetic-spaced-review-secret\n# changed comment\n')
+  await writeFile(notesPath, 'changed note\n')
+
+  const snapshot = await captureWorkspaceSnapshot(root, limits, { allowedPaths: [allowed] })
+  assert.match(snapshot.git.diff.text, /REDACTED SENSITIVE FILE DIFF/)
+  assert.doesNotMatch(snapshot.git.diff.text, /synthetic-spaced-review-secret/)
+  assert.doesNotMatch(snapshot.git.diff.text, /baseline comment|changed comment/)
+  assert.match(snapshot.git.diff.text, /changed note/)
+})
+
 test('workspace delta records committed changes between HEADs', async () => {
   const { root, allowed } = await makeRepo()
   const before = await captureWorkspaceSnapshot(root, limits, { allowedPaths: [allowed] })
