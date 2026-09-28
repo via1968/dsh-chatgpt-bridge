@@ -1,0 +1,20 @@
+{
+  "name": "dsh-chatgpt-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/config.mjs && node --check src/persistence.mjs && node --check src/workspace.mjs && node --check src/dsh-acp.mjs && node --check src/oauth.mjs && node --check src/core.mjs && node --check src/mcp.mjs && node --check src/server.mjs",
+    "test": "node --test",
+    "smoke:dsh": "node scripts/dsh-acp-smoke.mjs"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  }
+}
