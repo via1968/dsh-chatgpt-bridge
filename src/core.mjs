@@ -7,6 +7,10 @@ const OPERATIONS = new Set(['read', 'write', 'execute'])
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'refusal', 'cancelled', 'max_turn_requests'])
 const ACTIVE_TASK_STATUSES = new Set(['queued', 'running', 'waiting_permission', 'pausing', 'cancelling', 'collecting_evidence', 'paused', 'needs_reconcile', 'waiting_review', 'rework_required'])
 const RUNNABLE_TASK_STATUSES = new Set(['queued', 'running', 'rework_required', 'paused', 'needs_reconcile'])
+const TASK_WAIT_TERMINAL_STATUSES = new Set(['waiting_review', 'accepted', 'rework_required', 'failed', 'cancelled', 'needs_reconcile', 'paused'])
+const TASK_WAIT_IMMEDIATE_STATUSES = new Set([...TASK_WAIT_TERMINAL_STATUSES, 'waiting_permission'])
+const DEFAULT_WAIT_TIMEOUT_MS = 30000
+const MAX_WAIT_TIMEOUT_MS = 60000
 
 function now() {
   return new Date().toISOString()
@@ -16,6 +20,14 @@ function text(value, label, { max = 20000, optional = false } = {}) {
   if (value === undefined && optional) return undefined
   if (typeof value !== 'string' || value.trim() === '') throw new Error(`${label} must be a non-empty string`)
   if (value.length > max) throw new Error(`${label} exceeds ${max} characters`)
+  return value
+}
+
+function waitTimeout(value) {
+  if (value === undefined) return DEFAULT_WAIT_TIMEOUT_MS
+  if (!Number.isInteger(value) || value < 0 || value > MAX_WAIT_TIMEOUT_MS) {
+    throw new Error(`timeoutMs must be an integer between 0 and ${MAX_WAIT_TIMEOUT_MS}`)
+  }
   return value
 }
 
@@ -311,6 +323,7 @@ export class BridgeCore extends EventEmitter {
     const requestedVersion = input.version === undefined ? undefined : Number(input.version)
     const content = { planId, objective, scope: { workspace, allowedPaths, operations, executionCwd }, constraints, acceptanceCriteria, executionPrompt }
     let result
+    const invalidatedApprovalIds = []
     await this.store.mutate(state => {
       const existing = state.plans[planId]
       const version = existing === undefined ? 1 : existing.latestVersion + 1
@@ -328,6 +341,17 @@ export class BridgeCore extends EventEmitter {
       if (existing === undefined) state.plans[planId] = { latestVersion: version, versions: { [String(version)]: plan } }
       else {
         const previous = existing.versions[String(existing.latestVersion)]
+        if (previous !== undefined) {
+          for (const approval of Object.values(state.approvals)) {
+            if (approval.planId !== planId || approval.version !== previous.version || approval.status !== 'pending') continue
+            approval.status = 'rejected'
+            approval.invalidated = true
+            approval.invalidatedReason = 'plan_superseded'
+            approval.comment = '审批因提交更新的计划版本而失效'
+            approval.decidedAt = now()
+            invalidatedApprovalIds.push(approval.id)
+          }
+        }
         if (previous !== undefined && !['accepted', 'rejected', 'superseded'].includes(previous.status)) {
           previous.status = 'superseded'
           previous.supersededAt = now()
@@ -337,6 +361,7 @@ export class BridgeCore extends EventEmitter {
       }
       result = clone(plan)
     })
+    for (const approvalId of invalidatedApprovalIds) this.emit('approval-updated', { approvalId })
     return result
   }
 
@@ -370,6 +395,7 @@ export class BridgeCore extends EventEmitter {
       plan.approvals.push(approvalId)
       result = { status: 'approval_pending', approval: clone(approval), plan: clone(plan) }
     })
+    if (result.approval?.id !== undefined) this.emit('approval-updated', { approvalId: result.approval.id })
     return result
   }
 
@@ -390,6 +416,7 @@ export class BridgeCore extends EventEmitter {
       plan.updatedAt = now()
       result = { approval: clone(approval), plan: clone(plan) }
     })
+    this.emit('approval-updated', { approvalId })
     return result
   }
 
@@ -399,6 +426,7 @@ export class BridgeCore extends EventEmitter {
 
   async startTask(input) {
     const taskId = input.taskId === undefined ? newId('task') : text(input.taskId, 'taskId', { max: 120 })
+    if (typeof this.dsh.preflightPolicy === 'function') await this.dsh.preflightPolicy()
     let task
     let idempotent = false
     await this.store.mutate(async state => {
@@ -415,6 +443,15 @@ export class BridgeCore extends EventEmitter {
       }
       if (!planMayMutate && this.config.dsh.permissionMode === 'workspace-write') {
         throw errorWithCode('a read-only plan cannot run under the broader workspace-write DSH mode', 'DSH_POLICY_TOO_BROAD')
+      }
+      if (typeof this.dsh.policyStatus === 'function') {
+        const policy = this.dsh.policyStatus()
+        if (policy?.readBoundary !== 'confined') {
+          throw errorWithCode(
+            `DSH read boundary is not enforceable for bridge-controlled tasks: ${policy?.readBoundaryReason ?? 'effective read confinement is unverified'}`,
+            'DSH_READ_BOUNDARY_UNENFORCEABLE',
+          )
+        }
       }
       const existingById = state.tasks[taskId]
       if (existingById !== undefined) {
@@ -819,6 +856,7 @@ export class BridgeCore extends EventEmitter {
       }
     }
     let request
+    let changed = false
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
       if (current === undefined || current.pendingPermissionId !== permissionId || current.status !== 'waiting_permission' || current.cancelRequested === true || current.pauseRequested === true) {
@@ -840,11 +878,14 @@ export class BridgeCore extends EventEmitter {
       delete current.permissionDecisionToken
       this.appendEventInMemory(current, 'permission.decided', { allow: allow === true, optionId, toolKind: request.toolCall.kind })
       if (current.status === 'waiting_permission') current.status = 'running'
+      changed = true
     })
+    if (changed) this.emit('task-updated', { taskId })
     return this.getTask(taskId)
   }
 
   async clearPendingPermission(taskId, permissionId, eventKind, data = {}) {
+    let changed = false
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
       if (current === undefined || current.pendingPermissionId !== permissionId) return
@@ -853,7 +894,9 @@ export class BridgeCore extends EventEmitter {
       delete current.permissionDecisionToken
       if (current.status === 'waiting_permission') current.status = 'running'
       this.appendEventInMemory(current, eventKind, data)
+      changed = true
     })
+    if (changed) this.emit('task-updated', { taskId })
   }
 
   async getTask(taskId) {
@@ -861,6 +904,43 @@ export class BridgeCore extends EventEmitter {
       const task = state.tasks[taskId]
       if (task === undefined) throw new Error(`unknown task: ${taskId}`)
       return clone(task)
+    })
+  }
+
+  async waitForTask({ taskId, afterEventSeq, timeoutMs }) {
+    const initial = await this.getTask(taskId)
+    const cursor = afterEventSeq === undefined ? initial.eventSeq : afterEventSeq
+    if (!Number.isInteger(cursor) || cursor < 0) throw new Error('afterEventSeq must be a non-negative integer')
+    const changed = initial.eventSeq > cursor
+    if (changed || TASK_WAIT_IMMEDIATE_STATUSES.has(initial.status) || initial.pendingPermissionId !== undefined) {
+      return { task: initial, timedOut: false, changed, afterEventSeq: cursor }
+    }
+    const duration = waitTimeout(timeoutMs)
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timer
+      const cleanup = () => {
+        this.off('task-updated', onUpdate)
+        if (timer !== undefined) clearTimeout(timer)
+      }
+      const finish = async timedOut => {
+        if (settled) return
+        try {
+          const task = await this.getTask(taskId)
+          if (!timedOut && task.eventSeq <= cursor && !TASK_WAIT_IMMEDIATE_STATUSES.has(task.status) && task.pendingPermissionId === undefined) return
+          settled = true
+          cleanup()
+          resolve({ task, timedOut, changed: task.eventSeq > cursor, afterEventSeq: cursor })
+        } catch (error) {
+          settled = true
+          cleanup()
+          reject(error)
+        }
+      }
+      const onUpdate = () => { void finish(false) }
+      this.on('task-updated', onUpdate)
+      timer = setTimeout(() => { void finish(true) }, duration)
+      void finish(false)
     })
   }
 
@@ -877,6 +957,41 @@ export class BridgeCore extends EventEmitter {
       const approval = state.approvals[approvalId]
       if (approval === undefined) throw new Error(`unknown approval: ${approvalId}`)
       return clone(approval)
+    })
+  }
+
+  async waitForApproval({ approvalId, afterStatus, timeoutMs }) {
+    const initial = await this.getApproval(approvalId)
+    if (afterStatus !== undefined && !['pending', 'approved', 'rejected'].includes(afterStatus)) throw new Error('afterStatus must be pending, approved, or rejected')
+    const cursor = afterStatus ?? initial.status
+    const changed = initial.status !== cursor
+    if (changed || initial.status !== 'pending') return { approval: initial, timedOut: false, changed, afterStatus: cursor }
+    const duration = waitTimeout(timeoutMs)
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timer
+      const cleanup = () => {
+        this.off('approval-updated', onUpdate)
+        if (timer !== undefined) clearTimeout(timer)
+      }
+      const finish = async timedOut => {
+        if (settled) return
+        try {
+          const approval = await this.getApproval(approvalId)
+          if (!timedOut && approval.status === cursor) return
+          settled = true
+          cleanup()
+          resolve({ approval, timedOut, changed: approval.status !== cursor, afterStatus: cursor })
+        } catch (error) {
+          settled = true
+          cleanup()
+          reject(error)
+        }
+      }
+      const onUpdate = event => { if (event?.approvalId === approvalId) void finish(false) }
+      this.on('approval-updated', onUpdate)
+      timer = setTimeout(() => { void finish(true) }, duration)
+      void finish(false)
     })
   }
 
@@ -967,9 +1082,11 @@ export class BridgeCore extends EventEmitter {
   }
 
   async onPermissionTerminal(request, decision) {
+    let taskId
     await this.store.mutate(state => {
       const task = taskBySession(state, request.sessionId)
       if (task === undefined) return
+      taskId = task.id
       if (task.pendingPermissionId === request.permissionId && (decision === 'timeout' || decision === 'error')) {
         task.pendingPermissionId = undefined
         task.pendingPermission = undefined
@@ -977,9 +1094,11 @@ export class BridgeCore extends EventEmitter {
       }
       this.appendEventInMemory(task, `permission.${decision}`, { permissionId: request.permissionId })
     })
+    if (taskId !== undefined) this.emit('task-updated', { taskId })
   }
 
   async onDshProcessExit(event) {
+    const taskIds = []
     await this.store.mutate(state => {
       for (const task of Object.values(state.tasks)) {
         if (['queued', 'running', 'waiting_permission', 'pausing', 'cancelling'].includes(task.status)) {
@@ -990,9 +1109,11 @@ export class BridgeCore extends EventEmitter {
           delete task.cancelRequested
           delete task.pauseRequested
           this.appendEventInMemory(task, 'dsh.process_exit', event)
+          taskIds.push(task.id)
         }
       }
     })
+    for (const taskId of taskIds) this.emit('task-updated', { taskId })
     this.emit('dsh-process-exit', event)
   }
 

@@ -521,3 +521,154 @@ test('unknown ACP permission tool shapes are denied instead of treated as execut
   )
   assert.deepEqual(dsh.permissionDecisions, [{ permissionId: 'permission-1', allow: false }])
 })
+
+test('task start fails closed when DSH read confinement is not verified', async () => {
+  const { core, workspace, dsh } = await makeCore()
+  dsh.preflightPolicy = async () => ({ verification: 'pending' })
+  dsh.policyStatus = () => ({ readBoundary: 'unverified', readBoundaryReason: 'test adapter has no read fence' })
+  const plan = await approvedPlan(core, workspace)
+
+  await assert.rejects(
+    core.startTask({ planId: plan.planId, version: plan.version, taskId: 'unverified-read-boundary' }),
+    error => error.code === 'DSH_READ_BOUNDARY_UNENFORCEABLE',
+  )
+  await assert.rejects(core.getTask('unverified-read-boundary'), /unknown task/)
+})
+
+test('bounded task wait wakes on a new event and reports timeout explicitly', async () => {
+  const { core, workspace, dsh } = await makeCore()
+  const promptGate = deferred()
+  dsh.promptGate = promptGate
+  const plan = await approvedPlan(core, workspace)
+  const started = await core.startTask({ planId: plan.planId, version: plan.version, taskId: 'wait-task' })
+  await waitFor(async () => {
+    const current = await core.getTask(started.id)
+    return current.status === 'running' && current.dshSessionId === 'session-1'
+  })
+  const running = await core.getTask(started.id)
+  const waiting = core.waitForTask({ taskId: started.id, afterEventSeq: running.eventSeq, timeoutMs: 1000 })
+  dsh.emit('update', {
+    sequence: 1,
+    at: new Date().toISOString(),
+    sessionId: 'session-1',
+    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'wait event' } },
+  })
+  const changed = await waiting
+  assert.equal(changed.timedOut, false)
+  assert.equal(changed.changed, true)
+  assert.ok(changed.task.eventSeq > running.eventSeq)
+
+  const cursor = changed.task.eventSeq
+  const timedOut = await core.waitForTask({ taskId: started.id, afterEventSeq: cursor, timeoutMs: 0 })
+  assert.equal(timedOut.timedOut, true)
+  assert.equal(timedOut.changed, false)
+  promptGate.resolve(dsh.promptResult)
+  await waitFor(async () => (await core.getTask(started.id)).status === 'waiting_review')
+})
+
+test('task wait returns immediately while a permission request is actionable', async () => {
+  const { core, workspace, dsh } = await makeCore()
+  const promptGate = deferred()
+  dsh.promptGate = promptGate
+  const plan = await approvedPlan(core, workspace)
+  const started = await core.startTask({ planId: plan.planId, version: plan.version, taskId: 'wait-permission' })
+  await waitFor(async () => {
+    const current = await core.getTask(started.id)
+    return current.status === 'running' && current.dshSessionId === 'session-1'
+  })
+
+  dsh.emit('permission-request', {
+    permissionId: 'wait-permission-request',
+    sessionId: 'session-1',
+    toolCall: { toolCallId: 'wait-permission-call', kind: 'edit', name: 'write', rawInput: { file_path: 'inside.txt' } },
+  })
+  await waitFor(async () => (await core.getTask(started.id)).status === 'waiting_permission')
+
+  const waiting = await core.waitForTask({ taskId: started.id, timeoutMs: 0 })
+  assert.equal(waiting.timedOut, false)
+  assert.equal(waiting.changed, false)
+  assert.equal(waiting.task.status, 'waiting_permission')
+  assert.equal(waiting.task.pendingPermissionId, 'wait-permission-request')
+
+  await core.decidePermission({ taskId: started.id, permissionId: 'wait-permission-request', allow: false })
+  promptGate.resolve(dsh.promptResult)
+  await waitFor(async () => (await core.getTask(started.id)).status === 'waiting_review')
+})
+
+test('task wait wakes when the DSH process exits', async () => {
+  const { core, workspace, dsh } = await makeCore()
+  const promptGate = deferred()
+  dsh.promptGate = promptGate
+  const plan = await approvedPlan(core, workspace)
+  const started = await core.startTask({ planId: plan.planId, version: plan.version, taskId: 'wait-process-exit' })
+  await waitFor(async () => {
+    const current = await core.getTask(started.id)
+    return current.status === 'running' && current.dshSessionId === 'session-1'
+  })
+  const running = await core.getTask(started.id)
+  const waiting = core.waitForTask({ taskId: started.id, afterEventSeq: running.eventSeq, timeoutMs: 1000 })
+
+  dsh.emit('process-exit', { code: 1, signal: null, message: 'DSH exited during task' })
+  const exited = await waiting
+  assert.equal(exited.timedOut, false)
+  assert.equal(exited.changed, true)
+  assert.equal(exited.task.status, 'failed')
+  assert.match(exited.task.error, /DSH exited during task/)
+
+  promptGate.resolve({ stopReason: 'cancelled', assistantText: '' })
+  await waitFor(async () => {
+    const current = await core.getTask(started.id)
+    return current.status === 'failed' && current.evidenceIds.some(id => core.store.state.evidence[id]?.kind === 'task.event_log')
+  })
+})
+
+test('bounded approval wait wakes only through the human approval channel', async () => {
+  const { core, workspace } = await makeCore()
+  const plan = await core.submitPlan({
+    planId: 'wait-approval',
+    objective: 'test approval wait',
+    scope: { workspace, allowedPaths: [workspace], operations: ['read'] },
+    constraints: [],
+    acceptanceCriteria: [{ id: 'c1', description: 'a verifiable result' }],
+    executionPrompt: 'perform the test task',
+  })
+  const requested = await core.requestPlanApproval({ planId: plan.planId, version: plan.version })
+  const waiting = core.waitForApproval({ approvalId: requested.approval.id, afterStatus: 'pending', timeoutMs: 1000 })
+  const approved = await core.decideHumanApproval(requested.approval.id, 'approve', 'test approval')
+  const changed = await waiting
+  assert.equal(approved.approval.status, 'approved')
+  assert.equal(changed.timedOut, false)
+  assert.equal(changed.changed, true)
+  assert.equal(changed.approval.status, 'approved')
+})
+
+test('superseding a plan invalidates its pending approval and wakes waiters', async () => {
+  const { core, workspace } = await makeCore()
+  const first = await core.submitPlan({
+    planId: 'wait-invalidated-approval',
+    objective: 'first plan',
+    scope: { workspace, allowedPaths: [workspace], operations: ['read'] },
+    constraints: [],
+    acceptanceCriteria: [{ id: 'c1', description: 'a verifiable result' }],
+    executionPrompt: 'perform the first test task',
+  })
+  const requested = await core.requestPlanApproval({ planId: first.planId, version: first.version })
+  const waiting = core.waitForApproval({ approvalId: requested.approval.id, afterStatus: 'pending', timeoutMs: 1000 })
+
+  const second = await core.submitPlan({
+    planId: first.planId,
+    objective: 'updated plan',
+    scope: { workspace, allowedPaths: [workspace], operations: ['read'] },
+    constraints: [],
+    acceptanceCriteria: [{ id: 'c1', description: 'an updated verifiable result' }],
+    executionPrompt: 'perform the updated test task',
+  })
+  const changed = await waiting
+  assert.equal(second.version, 2)
+  assert.equal(changed.timedOut, false)
+  assert.equal(changed.changed, true)
+  assert.equal(changed.approval.status, 'rejected')
+  assert.equal(changed.approval.invalidated, true)
+  assert.equal(changed.approval.invalidatedReason, 'plan_superseded')
+  await assert.rejects(core.decideHumanApproval(requested.approval.id, 'approve'), /already rejected/)
+})

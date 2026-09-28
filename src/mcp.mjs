@@ -51,6 +51,15 @@ export function createMcpServer(core, auth, kind) {
       inputSchema: { taskId: z.string().min(1) },
     }, args => core.getTask(args.taskId))
 
+    register(server, 'bridge_wait_task', {
+      ...hint('Wait for a task event or terminal state without starting, retrying, or mutating the task. The wait is bounded and returns timed_out when no change occurs.'),
+      inputSchema: {
+        taskId: z.string().min(1),
+        afterEventSeq: z.number().int().nonnegative().optional(),
+        timeoutMs: z.number().int().min(0).max(60000).optional(),
+      },
+    }, args => core.waitForTask(args))
+
     register(server, 'bridge_inspect_evidence', {
       ...hint('Read one persisted evidence record by identifier, including its content hash and capture data.'),
       inputSchema: { evidenceId: z.string().min(1) },
@@ -60,6 +69,15 @@ export function createMcpServer(core, auth, kind) {
       ...hint('Read the status of a human approval request. Approval is completed through the separate authenticated human channel.'),
       inputSchema: { approvalId: z.string().min(1) },
     }, args => core.getApproval(args.approvalId))
+
+    register(server, 'bridge_wait_approval', {
+      ...hint('Wait for a human approval status change through the separate channel. This tool is bounded, read-only, and cannot approve or reject.'),
+      inputSchema: {
+        approvalId: z.string().min(1),
+        afterStatus: z.enum(['pending', 'approved', 'rejected']).optional(),
+        timeoutMs: z.number().int().min(0).max(60000).optional(),
+      },
+    }, args => core.waitForApproval(args))
 
     register(server, 'bridge_inspect_workspace', {
       ...hint('Capture read-only git/workspace facts. This tool does not modify files or execute project commands.'),

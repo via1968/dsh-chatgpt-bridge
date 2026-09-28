@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import {
   client as createAcpClientApp,
@@ -29,6 +32,39 @@ function quoteWindowsCmdArg(value) {
   return `"${text.replaceAll('"', '\\"')}"`
 }
 
+function errorWithCode(message, code) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
+function expectedApprovalPolicy(permissionMode) {
+  return permissionMode === 'danger-full-access' ? 'never' : 'ask'
+}
+
+function settingsDefaultPreset(source) {
+  const inline = source.match(/^\s*permission:\s*\{[^\n}]*\bdefaultPreset\s*:\s*["']?([A-Za-z-]+)["']?[^\n}]*\}\s*$/m)
+  if (inline !== null) return inline[1]
+  let permissionIndent
+  for (const line of source.split(/\r?\n/)) {
+    if (/^\s*(?:#.*)?$/.test(line)) continue
+    const permission = line.match(/^(\s*)permission:\s*$/)
+    if (permission !== null) {
+      permissionIndent = permission[1].length
+      continue
+    }
+    if (permissionIndent === undefined) continue
+    const indent = line.match(/^(\s*)/)?.[1].length ?? 0
+    if (indent <= permissionIndent) {
+      permissionIndent = undefined
+      continue
+    }
+    const preset = line.match(/^\s+defaultPreset:\s*["']?([A-Za-z-]+)["']?(?:\s+#.*)?$/)
+    if (preset !== null) return preset[1]
+  }
+  return undefined
+}
+
 /**
  * External DSH adapter. The bridge talks to the stable ACP surface and does
  * not import or patch DSH's internal Cordis services.
@@ -49,7 +85,113 @@ export class DshAcpManager extends EventEmitter {
     this.pendingPermissions = new Map()
     this.outputs = new Map()
     this.toolCalls = new Map()
+    this.sessionPolicies = new Map()
+    this.lastPolicyPreflight = undefined
+    this.lastPolicyEvidence = undefined
     this.sequence = 0
+  }
+
+  dshHome() {
+    const configured = this.config.extraEnv?.DSH_HOME ?? process.env.DSH_HOME
+    return resolve(this.config.launchCwd ?? process.cwd(), configured ?? join(homedir(), '.dsh'))
+  }
+
+  readBoundaryStatus() {
+    if (process.platform === 'win32') {
+      return {
+        status: 'unconfined',
+        reason: 'the DSH Windows ACL backend documents write confinement but does not confine reads',
+      }
+    }
+    return {
+      status: 'unverified',
+      reason: 'ACP does not expose a verifiable read-confinement capability for this DSH adapter',
+    }
+  }
+
+  policyStatus() {
+    const last = this.lastPolicyEvidence
+    const readBoundary = this.readBoundaryStatus()
+    const expectedApproval = expectedApprovalPolicy(this.config.permissionMode)
+    const effectiveMatches = last !== undefined
+      && last.preset === this.config.permissionMode
+      && last.sandbox === this.config.permissionMode
+      && last.approval === expectedApproval
+    return {
+      configuredPermissionMode: this.config.permissionMode,
+      settingsDefaultPreset: this.lastPolicyPreflight?.settingsDefaultPreset,
+      effectivePermissionMode: last?.preset,
+      effectiveSandbox: last?.sandbox,
+      effectiveApprovalPolicy: last?.approval,
+      verification: last === undefined ? 'unverified' : (effectiveMatches ? 'verified' : 'mismatch'),
+      evidenceSource: last === undefined ? undefined : 'dsh-session-projection',
+      sessionId: last?.sessionId,
+      readBoundary: readBoundary.status,
+      readBoundaryReason: readBoundary.reason,
+    }
+  }
+
+  async preflightPolicy() {
+    const requested = this.config.permissionMode
+    if (requested === 'danger-full-access') {
+      throw errorWithCode('DSH_PERMISSION_MODE=danger-full-access is not allowed for bridge-controlled tasks', 'DSH_POLICY_TOO_BROAD')
+    }
+    const settingsPath = join(this.dshHome(), 'settings.yaml')
+    let source
+    try {
+      source = await readFile(settingsPath, 'utf8')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw errorWithCode(`cannot inspect DSH permission settings: ${error.message}`, 'DSH_POLICY_UNVERIFIED')
+    }
+    const defaultPreset = source === undefined ? undefined : settingsDefaultPreset(source)
+    this.lastPolicyPreflight = {
+      settingsDefaultPreset: defaultPreset,
+      settingsFilePresent: source !== undefined,
+      requestedPermissionMode: requested,
+    }
+    if (defaultPreset !== undefined && defaultPreset !== requested) {
+      throw errorWithCode(
+        `DSH session default preset ${defaultPreset} does not match requested bridge policy ${requested}; refusing to start`,
+        'DSH_POLICY_MISMATCH',
+      )
+    }
+    return { ...this.lastPolicyPreflight }
+  }
+
+  async verifySessionPolicy(sessionId) {
+    const cachePath = join(this.dshHome(), 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
+    let value
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        const parsed = JSON.parse(await readFile(cachePath, 'utf8'))
+        value = parsed?.record?.rows?.permissions?.val
+        if (typeof value?.preset === 'string' && typeof value?.sandbox === 'string' && typeof value?.approval === 'string') break
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && attempt === 39) throw errorWithCode(`cannot read DSH session policy evidence: ${error.message}`, 'DSH_POLICY_UNVERIFIED')
+      }
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
+    }
+    if (typeof value?.preset !== 'string' || typeof value?.sandbox !== 'string' || typeof value?.approval !== 'string') {
+      throw errorWithCode('DSH ACP did not expose a complete effective session policy; refusing to run', 'DSH_POLICY_UNVERIFIED')
+    }
+    const expectedApproval = expectedApprovalPolicy(this.config.permissionMode)
+    const evidence = {
+      sessionId,
+      preset: value.preset,
+      sandbox: value.sandbox,
+      approval: value.approval,
+      expectedPermissionMode: this.config.permissionMode,
+      evidenceSource: 'dsh-session-projection',
+    }
+    this.lastPolicyEvidence = evidence
+    this.sessionPolicies.set(sessionId, evidence)
+    if (value.preset !== this.config.permissionMode || value.sandbox !== this.config.permissionMode || value.approval !== expectedApproval) {
+      throw errorWithCode(
+        `DSH effective session policy does not match bridge policy (preset=${value.preset}, sandbox=${value.sandbox}, approval=${value.approval}, expected=${this.config.permissionMode}/${expectedApproval}); refusing to run`,
+        'DSH_POLICY_MISMATCH',
+      )
+    }
+    return { ...evidence }
   }
 
   async ensureConnected() {
@@ -92,6 +234,8 @@ export class DshAcpManager extends EventEmitter {
           this.agent = undefined
           this.connection = undefined
           this.activeSessions.clear()
+          this.sessionPolicies.clear()
+          this.lastPolicyEvidence = undefined
           this.toolCalls.clear()
         }
       })
@@ -249,14 +393,28 @@ export class DshAcpManager extends EventEmitter {
       throw new Error('DSH ACP returned no session id')
     }
     this.activeSessions.add(result.sessionId)
-    return result.sessionId
+    try {
+      await this.verifySessionPolicy(result.sessionId)
+      return result.sessionId
+    } catch (error) {
+      this.activeSessions.delete(result.sessionId)
+      try { await agent.request(methods.agent.session.close, { sessionId: result.sessionId }) } catch { /* best effort */ }
+      throw error
+    }
   }
 
   async resumeSession(sessionId, cwd) {
     const agent = await this.ensureConnected()
     const result = await agent.request(methods.agent.session.resume, { sessionId, cwd, mcpServers: [] })
     this.activeSessions.add(sessionId)
-    return { sessionId, result }
+    try {
+      await this.verifySessionPolicy(sessionId)
+      return { sessionId, result }
+    } catch (error) {
+      this.activeSessions.delete(sessionId)
+      try { await agent.request(methods.agent.session.close, { sessionId }) } catch { /* best effort */ }
+      throw error
+    }
   }
 
   async ensureSession(sessionId, cwd) {
@@ -327,6 +485,7 @@ export class DshAcpManager extends EventEmitter {
       activeSessionCount: this.activeSessions.size,
       pendingPermissionCount: this.pendingPermissions.size,
       lastError: this.lastError,
+      policy: this.policyStatus(),
     }
   }
 
@@ -338,6 +497,8 @@ export class DshAcpManager extends EventEmitter {
     this.agent = undefined
     this.connection = undefined
     this.activeSessions.clear()
+    this.sessionPolicies.clear()
+    this.lastPolicyEvidence = undefined
     this.toolCalls.clear()
     this.rejectPendingPermissions(new Error('DSH adapter stopped'))
     try { await connection?.close?.() } catch { /* best effort */ }
@@ -364,6 +525,8 @@ export class DshAcpManager extends EventEmitter {
     this.agent = undefined
     this.connection = undefined
     this.activeSessions.clear()
+    this.sessionPolicies.clear()
+    this.lastPolicyEvidence = undefined
     this.toolCalls.clear()
     this.rejectPendingPermissions(new Error('DSH adapter closed'))
   }
