@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { assertDirectory, assertPathListAllowed, captureWorkspaceDelta, captureWorkspaceSnapshot, isPathWithin, normalizeAbsolutePath } from './workspace.mjs'
+import { assertDirectory, assertPathListAllowed, captureWorkspaceDelta, captureWorkspaceSnapshot, isPathWithin, normalizeAbsolutePath, resolvePathForScope } from './workspace.mjs'
 import { clone, newId, sha256, stableStringify } from './persistence.mjs'
 
 const OPERATIONS = new Set(['read', 'write', 'execute'])
@@ -93,18 +93,18 @@ function pathValuesFromToolCall(toolCall = {}) {
   const rawInput = toolCall.rawInput
   if (rawInput === null || typeof rawInput !== 'object') return []
   const values = []
-  const visit = value => {
+  const visit = (value, forcePath = false) => {
     if (typeof value === 'string') {
-      if (/[/\\]/.test(value) || /^[A-Za-z]:/.test(value)) values.push(value)
+      if (forcePath || /[/\\]/.test(value) || /^[A-Za-z]:/.test(value)) values.push(value)
       return
     }
     if (Array.isArray(value)) {
-      for (const item of value) visit(item)
+      for (const item of value) visit(item, forcePath)
       return
     }
     if (value !== null && typeof value === 'object') {
       for (const [key, item] of Object.entries(value)) {
-        if (/^(file_?path|path|paths|directory|directories|cwd|workdir|workspace)$/i.test(key)) visit(item)
+        if (/^(file_?path|path|paths|directory|directories|cwd|workdir|workspace|target|source|destination)$/i.test(key)) visit(item, true)
         else if (Array.isArray(item) || (item !== null && typeof item === 'object')) visit(item)
       }
     }
@@ -113,15 +113,56 @@ function pathValuesFromToolCall(toolCall = {}) {
   return values
 }
 
-function toolCallWithinScope(toolCall, allowedPaths, executionCwd) {
+function commandValuesFromToolCall(toolCall = {}) {
+  const rawInput = toolCall.rawInput
+  if (rawInput === null || typeof rawInput !== 'object') return []
+  const values = []
+  for (const [key, value] of Object.entries(rawInput)) {
+    if (/^(command|commands|cmd|script|shell)$/i.test(key)) {
+      if (typeof value === 'string') values.push(value)
+      else if (Array.isArray(value)) values.push(...value.filter(item => typeof item === 'string'))
+    }
+  }
+  return values
+}
+
+const PERMISSION_MODE_RANK = new Map([
+  ['read-only', 0],
+  ['workspace-write', 1],
+  ['danger-full-access', 2],
+])
+
+function requestedPermissionMode(toolCall = {}) {
+  const rawInput = toolCall.rawInput
+  if (rawInput === null || typeof rawInput !== 'object') return undefined
+  const value = rawInput.sandbox_permissions ?? rawInput.sandboxPermissions ?? rawInput.permissionMode
+  if (value === undefined) return undefined
+  return String(value).trim().toLowerCase()
+}
+
+async function toolCallWithinScope(toolCall, allowedPaths, executionCwd, operation, configuredPermissionMode) {
+  const requestedMode = requestedPermissionMode(toolCall)
+  if (requestedMode !== undefined && !PERMISSION_MODE_RANK.has(requestedMode)) {
+    return { ok: false, code: 'PERMISSION_OUT_OF_SCOPE', reason: `unsupported sandbox permission mode: ${requestedMode}` }
+  }
+  if (requestedMode !== undefined && PERMISSION_MODE_RANK.get(requestedMode) > PERMISSION_MODE_RANK.get(configuredPermissionMode)) {
+    return { ok: false, code: 'PERMISSION_OUT_OF_SCOPE', reason: `sandbox permission mode exceeds bridge policy: ${requestedMode}` }
+  }
+  if (operation === 'execute' && commandValuesFromToolCall(toolCall).length > 0) {
+    return { ok: false, code: 'PERMISSION_OUT_OF_SCOPE', reason: 'the command input cannot be proven to stay within the approved path scope' }
+  }
   const values = pathValuesFromToolCall(toolCall)
   for (const value of values) {
-    if (!value.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(value)) continue
-    const normalized = value.replaceAll('\\', '/')
-    if (!allowedPaths.some(path => isPathWithin(path, normalized))) {
-      return { ok: false, value }
+    let resolved
+    try {
+      resolved = await resolvePathForScope(value, executionCwd)
+    } catch (error) {
+      return { ok: false, value, reason: `could not resolve tool path: ${error.message}` }
     }
-    if (!isPathWithin(executionCwd, normalized)) return { ok: false, value }
+    if (!allowedPaths.some(path => isPathWithin(path, resolved))) {
+      return { ok: false, value, resolved }
+    }
+    if (!isPathWithin(executionCwd, resolved)) return { ok: false, value, resolved }
   }
   return { ok: true }
 }
@@ -139,6 +180,15 @@ function findPlanVersion(state, planId, version) {
   const selected = plan.versions[String(selectedVersion)]
   if (selected === undefined) throw new Error(`unknown plan version: ${planId}@${selectedVersion}`)
   return selected
+}
+
+function currentApprovedPlan(state, task) {
+  const plan = findPlanVersion(state, task.planId, task.planVersion)
+  const latest = latestPlan(state, task.planId)
+  if (plan.status !== 'approved' || latest.version !== plan.version || latest.hash !== task.planHash) {
+    throw errorWithCode('the task plan is no longer the currently approved plan version', 'PLAN_NOT_CURRENTLY_APPROVED')
+  }
+  return plan
 }
 
 function taskBySession(state, sessionId) {
@@ -192,30 +242,35 @@ export class BridgeCore extends EventEmitter {
     })
   }
 
-  async addEvidence({ taskId, kind, label, content }) {
+  createEvidenceInState(state, task, { kind, label, content }) {
     const id = newId('evidence')
     const safeContent = redactValue(content, this.config.limits.evidenceBytes)
+    const record = {
+      id,
+      taskId: task.id,
+      planId: task.planId,
+      planVersion: task.planVersion,
+      planHash: task.planHash,
+      executionRunId: task.executionRunId,
+      kind,
+      label: label ?? kind,
+      createdAt: now(),
+      content: safeContent,
+      sha256: sha256(safeContent),
+    }
+    state.evidence[id] = record
+    task.evidenceIds ??= []
+    task.evidenceIds.push(id)
+    task.updatedAt = now()
+    return record
+  }
+
+  async addEvidence({ taskId, kind, label, content }) {
     let record
     await this.store.mutate(state => {
       const task = state.tasks[taskId]
       if (task === undefined) throw errorWithCode(`unknown task: ${taskId}`, 'UNKNOWN_TASK')
-      record = {
-        id,
-        taskId,
-        planId: task.planId,
-        planVersion: task.planVersion,
-        planHash: task.planHash,
-        executionRunId: task.executionRunId,
-        kind,
-        label: label ?? kind,
-        createdAt: now(),
-        content: safeContent,
-        sha256: sha256(safeContent),
-      }
-      state.evidence[id] = record
-      task.evidenceIds ??= []
-      task.evidenceIds.push(id)
-      task.updatedAt = now()
+      record = this.createEvidenceInState(state, task, { kind, label, content })
     })
     return clone(record)
   }
@@ -348,6 +403,7 @@ export class BridgeCore extends EventEmitter {
     await this.store.mutate(async state => {
       const plan = findPlanVersion(state, input.planId, input.version)
       if (plan.status !== 'approved') throw new Error(`plan must be human-approved before start; current status=${plan.status}`)
+      if (latestPlan(state, plan.planId).version !== plan.version) throw errorWithCode('a newer plan version exists; start requires the currently approved version', 'PLAN_NOT_CURRENTLY_APPROVED')
       if (plan.scope.executionCwd === undefined) throw errorWithCode('plan has no enforceable DSH execution boundary; submit a new plan version', 'SCOPE_NOT_ENFORCEABLE')
       if (this.config.dsh.permissionMode === 'danger-full-access') {
         throw errorWithCode('DSH_PERMISSION_MODE=danger-full-access is not allowed for bridge-controlled tasks', 'DSH_POLICY_TOO_BROAD')
@@ -392,17 +448,6 @@ export class BridgeCore extends EventEmitter {
       this.appendEventInMemory(task, 'task.queued', { planId: plan.planId, version: plan.version, planHash: plan.hash })
     })
     if (idempotent) return this.getTask(taskId)
-    try {
-      const before = await captureWorkspaceSnapshot(task.workspace, this.config.limits, { allowedPaths: task.allowedPaths })
-      const evidence = await this.addEvidence({ taskId, kind: 'workspace.before', label: '执行前工作区状态', content: before })
-      await this.store.mutate(state => {
-        const current = state.tasks[taskId]
-        if (current !== undefined) current.workspaceBeforeEvidenceId = evidence.id
-      })
-      await this.appendEvent(taskId, 'evidence.workspace_before', { captured: true })
-    } catch (error) {
-      await this.appendEvent(taskId, 'evidence.workspace_before_failed', { error: error.message })
-    }
     void this.runTaskPrompt(taskId, undefined).catch(error => this.emit('internal-error', { stage: 'task.run', error: String(error?.message ?? error) }))
     return this.getTask(taskId)
   }
@@ -449,24 +494,25 @@ export class BridgeCore extends EventEmitter {
     return this.store.mutate(state => {
       const task = state.tasks[taskId]
       if (task === undefined || task.executionRunId !== runId) return false
+      if (task.cancelRequested === true || task.pauseRequested === true || task.status !== 'running') return false
+      const plan = currentApprovedPlan(state, task)
       if (task.dshSessionId === undefined) {
         task.dshSessionId = sessionId
         this.appendEventInMemory(task, 'dsh.session_created', { sessionId })
       }
-      return task.status === 'running' && task.cancelRequested !== true && task.pauseRequested !== true
+      return { plan: clone(plan), task: clone(task) }
     })
   }
 
   async runTaskPrompt(taskId, extra) {
     const runId = newId('run')
     let task
-    let plan
     let shouldRun = true
     try {
       await this.store.mutate(state => {
       task = state.tasks[taskId]
       if (task === undefined) throw errorWithCode(`unknown task: ${taskId}`, 'UNKNOWN_TASK')
-      plan = findPlanVersion(state, task.planId, task.planVersion)
+      currentApprovedPlan(state, task)
       if (!RUNNABLE_TASK_STATUSES.has(task.status)) throw new Error(`task cannot run from status ${task.status}`)
       if (task.cancelRequested === true) {
         task.status = 'cancelled'
@@ -482,17 +528,31 @@ export class BridgeCore extends EventEmitter {
       })
       if (!shouldRun) return
 
+      try {
+        const baseline = await this.getTask(taskId)
+        const before = await captureWorkspaceSnapshot(baseline.workspace, this.config.limits, { allowedPaths: baseline.allowedPaths })
+        const evidence = await this.addEvidence({ taskId, kind: 'workspace.before', label: '执行前工作区状态', content: before })
+        await this.store.mutate(state => {
+          const current = state.tasks[taskId]
+          if (current !== undefined && current.executionRunId === runId) current.workspaceBeforeEvidenceId = evidence.id
+        })
+        await this.appendEvent(taskId, 'evidence.workspace_before', { captured: true, runId })
+      } catch (error) {
+        await this.appendEvent(taskId, 'evidence.workspace_before_failed', { error: error.message, runId })
+      }
+
       let sessionId = task.dshSessionId
       if (sessionId === undefined) {
         sessionId = await this.dsh.createSession(task.executionCwd)
       } else {
         await this.dsh.ensureSession(sessionId, task.executionCwd)
       }
-      if (!await this.canPrompt(taskId, runId, sessionId)) {
+      const promptContext = await this.canPrompt(taskId, runId, sessionId)
+      if (!promptContext) {
         await this.finalizeRequestedStop(taskId, runId, sessionId)
         return
       }
-      const result = await this.dsh.prompt(sessionId, this.buildPrompt(plan, task, extra))
+      const result = await this.dsh.prompt(sessionId, this.buildPrompt(promptContext.plan, promptContext.task, extra))
       await this.finishTaskPrompt(taskId, result, runId)
     } catch (error) {
       await this.failTask(taskId, error, runId)
@@ -587,8 +647,7 @@ export class BridgeCore extends EventEmitter {
     if (!['paused', 'needs_reconcile'].includes(task.status)) throw new Error(`task cannot resume from status ${task.status}`)
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
-      const plan = findPlanVersion(state, current.planId, current.planVersion)
-      if (plan.status !== 'approved') throw new Error('the plan is no longer approved')
+      currentApprovedPlan(state, current)
       delete current.pauseRequested
       delete current.cancelRequested
       current.status = 'queued'
@@ -602,18 +661,26 @@ export class BridgeCore extends EventEmitter {
   async cancelTask(taskId) {
     const task = await this.getTask(taskId)
     if (['accepted', 'cancelled', 'failed'].includes(task.status)) return task
+    let sessionToCancel
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
-      current.cancelRequested = true
-      if (current.executionRunId === undefined && current.dshSessionId === undefined && current.status === 'queued') {
+      const activeExecution = ['running', 'waiting_permission', 'pausing', 'cancelling'].includes(current.status)
+      if (!activeExecution) {
         current.status = 'cancelled'
         delete current.cancelRequested
+        delete current.pauseRequested
+        current.pendingPermissionId = undefined
+        current.pendingPermission = undefined
+        this.appendEventInMemory(current, 'task.cancelled', { activeExecution: false })
       } else {
+        current.cancelRequested = true
+        delete current.pauseRequested
         current.status = 'cancelling'
+        sessionToCancel = current.dshSessionId
+        this.appendEventInMemory(current, 'task.cancel_requested', {})
       }
-      this.appendEventInMemory(current, 'task.cancel_requested', {})
     })
-    if (task.dshSessionId !== undefined) await this.dsh.cancel(task.dshSessionId)
+    if (sessionToCancel !== undefined) await this.dsh.cancel(sessionToCancel)
     return this.getTask(taskId)
   }
 
@@ -623,6 +690,7 @@ export class BridgeCore extends EventEmitter {
     if (!['waiting_review', 'rework_required'].includes(task.status)) throw new Error(`task cannot accept correction from status ${task.status}`)
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
+      currentApprovedPlan(state, current)
       delete current.pauseRequested
       delete current.cancelRequested
       current.correctionCount += 1
@@ -640,7 +708,7 @@ export class BridgeCore extends EventEmitter {
     let result
     await this.store.mutate(state => {
       const current = state.tasks[taskId]
-      const plan = findPlanVersion(state, current.planId, current.planVersion)
+      const plan = currentApprovedPlan(state, current)
       const expected = new Map(plan.acceptanceCriteria.map(item => [item.id, item]))
       const seen = new Set()
       const normalized = criteria.map(item => {
@@ -686,10 +754,7 @@ export class BridgeCore extends EventEmitter {
     const pending = task.pendingPermission
     if (pending?.sessionId !== task.dshSessionId) throw new Error('permission session does not match the task session')
     if (allow === true) {
-      const plan = await this.getPlan(task.planId, task.planVersion)
-      if (plan.status !== 'approved' || latestPlan((await this.store.snapshot()), task.planId).version !== task.planVersion) {
-        throw new Error('permission requires the currently approved plan version')
-      }
+      const plan = await this.store.mutate(state => currentApprovedPlan(state, task))
       const operation = operationForToolCall(pending?.toolCall)
       if (operation === 'unknown') {
         this.dsh.decidePermission(permissionId, { allow: false })
@@ -701,11 +766,24 @@ export class BridgeCore extends EventEmitter {
         await this.clearPendingPermission(taskId, permissionId, 'permission.denied_scope', { operation, toolKind: pending?.toolCall?.kind })
         throw errorWithCode(`permission denied because plan does not allow operation: ${operation}`, 'PERMISSION_OUT_OF_SCOPE')
       }
-      const pathCheck = toolCallWithinScope(pending?.toolCall, plan.scope.allowedPaths, plan.scope.executionCwd)
+      const pathCheck = await toolCallWithinScope(
+        pending?.toolCall,
+        plan.scope.allowedPaths,
+        plan.scope.executionCwd,
+        operation,
+        this.config.dsh.permissionMode,
+      )
       if (!pathCheck.ok) {
         this.dsh.decidePermission(permissionId, { allow: false })
-        await this.clearPendingPermission(taskId, permissionId, 'permission.denied_path', { path: pathCheck.value })
-        throw errorWithCode(`permission denied because the tool path is outside the approved scope: ${pathCheck.value}`, 'PERMISSION_OUT_OF_SCOPE')
+        await this.clearPendingPermission(taskId, permissionId, 'permission.denied_scope', {
+          path: pathCheck.value,
+          resolvedPath: pathCheck.resolved,
+          reason: pathCheck.reason,
+        })
+        throw errorWithCode(
+          pathCheck.reason ?? `permission denied because the tool path is outside the approved scope: ${pathCheck.value}`,
+          pathCheck.code ?? 'PERMISSION_OUT_OF_SCOPE',
+        )
       }
     }
     const request = this.dsh.decidePermission(permissionId, { allow, optionId })
@@ -816,6 +894,11 @@ export class BridgeCore extends EventEmitter {
         }
       }
       this.appendEventInMemory(task, 'dsh.session_update', update)
+      this.createEvidenceInState(state, task, {
+        kind: 'dsh.session_update',
+        label: 'DSH ACP 完整会话更新',
+        content: update,
+      })
     })
     this.emit('task-updated', { sessionId: update.sessionId })
   }

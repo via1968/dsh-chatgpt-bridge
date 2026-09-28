@@ -12,6 +12,8 @@
 | `task.event_log` | 每轮结束 | 给出桥接状态变化和事件序号索引 |
 | `acceptance.record` | ChatGPT 记录验收时 | 将每条验收条件绑定到本任务证据 ID |
 
+每次收到 ACP `session/update` 都会立即追加一条独立的 `dsh.session_update` 证据；`task.events` 仍是用于状态查询的限长展示窗口，不能作为完整事件原件。事件内容同样执行脱敏和单条大小限制，超过限制的字段会明确标记截断。
+
 `accepted` 只表示桥接器验证了如下条件：
 
 1. 计划版本仍是被批准的版本；

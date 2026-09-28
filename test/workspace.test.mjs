@@ -60,6 +60,21 @@ test('sensitive untracked files are not returned as plaintext', async () => {
   assert.doesNotMatch(env.content, /another-secret/)
 })
 
+test('sensitive tracked diff context is redacted as a whole file block', async () => {
+  const { root, allowed } = await makeRepo()
+  const envPath = join(allowed, '.env')
+  await writeFile(envPath, 'CUSTOM_VALUE=synthetic-review-sensitive\n# baseline comment\n')
+  await git(root, 'add', '-f', join(relative(root, allowed), '.env'))
+  await git(root, 'commit', '-m', 'add sensitive file')
+  await writeFile(envPath, 'CUSTOM_VALUE=synthetic-review-sensitive\n# changed comment\n')
+
+  const snapshot = await captureWorkspaceSnapshot(root, limits, { allowedPaths: [allowed] })
+  assert.match(snapshot.git.diff.text, /diff --git a\/allowed\/.env b\/allowed\/.env/)
+  assert.match(snapshot.git.diff.text, /REDACTED SENSITIVE FILE DIFF/)
+  assert.doesNotMatch(snapshot.git.diff.text, /synthetic-review-sensitive/)
+  assert.doesNotMatch(snapshot.git.diff.text, /baseline comment|changed comment/)
+})
+
 test('workspace delta records committed changes between HEADs', async () => {
   const { root, allowed } = await makeRepo()
   const before = await captureWorkspaceSnapshot(root, limits, { allowedPaths: [allowed] })

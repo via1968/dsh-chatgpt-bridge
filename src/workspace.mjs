@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { access, lstat, readFile, realpath } from 'node:fs/promises'
 import { constants } from 'node:fs'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -20,6 +20,29 @@ export function isPathWithin(root, candidate) {
   if (rootResolved === candidateResolved) return true
   const child = relative(rootResolved, candidateResolved)
   return child !== '' && !child.startsWith(`..${sep}`) && child !== '..' && !isAbsolute(child)
+}
+
+/**
+ * Resolve a tool-supplied path from the DSH session cwd and account for
+ * symlinked parents even when the final path does not exist yet.
+ */
+export async function resolvePathForScope(value, baseDirectory) {
+  if (typeof value !== 'string' || value.trim() === '') throw new Error('tool path must be a non-empty string')
+  const lexical = resolve(baseDirectory, value)
+  let cursor = lexical
+  const missing = []
+  while (true) {
+    try {
+      const physical = await realpath(cursor)
+      return missing.reverse().reduce((current, segment) => join(current, segment), physical)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+      const parent = dirname(cursor)
+      if (parent === cursor) return lexical
+      missing.push(basename(cursor))
+      cursor = parent
+    }
+  }
 }
 
 export async function assertDirectory(path, label) {
@@ -80,14 +103,19 @@ function sensitivePath(path) {
 
 function redactGitDiff(value) {
   let sensitive = false
-  return String(value ?? '').split(/\r?\n/).map(line => {
+  const output = []
+  for (const line of String(value ?? '').split(/\r?\n/)) {
     const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line)
-    if (header !== null) sensitive = sensitivePath(header[1]) || sensitivePath(header[2])
-    if (sensitive && (/^[+-]/.test(line) && !line.startsWith('+++') && !line.startsWith('---'))) {
-      return `${line[0]}[REDACTED SENSITIVE FILE DIFF]`
+    if (header !== null) {
+      sensitive = sensitivePath(header[1]) || sensitivePath(header[2])
+      output.push(redactText(line))
+      if (sensitive) output.push('[REDACTED SENSITIVE FILE DIFF]')
+      continue
     }
-    return redactText(line)
-  }).join('\n')
+    if (sensitive) continue
+    output.push(redactText(line))
+  }
+  return output.join('\n')
 }
 
 function trimOutput(value, maxBytes) {
